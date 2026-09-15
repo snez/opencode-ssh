@@ -1,7 +1,8 @@
-import { execSync } from "child_process"
+import { execFileSync } from "child_process"
 import path from "path"
 import os from "os"
-import { writeFileSync } from "fs"
+import { mkdtempSync, writeFileSync } from "fs"
+import { randomBytes } from "crypto"
 import { z } from "zod"
 
 type SessionState = {
@@ -15,12 +16,23 @@ function sock(host: string) {
   return path.join(os.homedir(), ".ssh", `cm-${host}`)
 }
 
+function validHost(host: string) {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(host)
+}
+
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
+const tempDir = mkdtempSync(path.join(os.tmpdir(), "opencode-ssh-"))
+
 function ensureSentinel(): string {
-  const p = path.join(os.tmpdir(), "__opencode_remote_mode__")
+  const p = path.join(tempDir, "remote-mode")
   try {
     writeFileSync(
       p,
       "This tool is not available in remote SSH mode.\nUse the bash tool with cat/tee/grep/find over SSH instead.\n",
+      { flag: "wx", mode: 0o600 },
     )
   } catch {}
   return p
@@ -43,17 +55,20 @@ export default {
           },
           async execute(args, ctx) {
             const host = args.host
+            if (!validHost(host)) {
+              return "Invalid SSH host. Use a host alias from ~/.ssh/config."
+            }
             const socketPath = sock(host)
 
             const existing = sessionMap.get(ctx.sessionID)
             if (existing) {
               try {
-                execSync(`ssh -O stop -S "${existing.socketPath}" "${existing.host}"`, { stdio: "pipe" })
+                execFileSync("ssh", ["-O", "stop", "-S", existing.socketPath, existing.host], { stdio: "pipe" })
               } catch {}
             }
 
             try {
-              execSync(`ssh -MNf -S "${socketPath}" "${host}" 2>&1`, { stdio: "pipe", timeout: 15000 })
+              execFileSync("ssh", ["-MNf", "-S", socketPath, host], { stdio: "pipe", timeout: 15000 })
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e)
               return `Failed to connect to ${host}: ${msg}`
@@ -80,7 +95,7 @@ export default {
             if (!state) return "Not currently connected."
 
             try {
-              execSync(`ssh -O stop -S "${state.socketPath}" "${state.host}"`, { stdio: "pipe" })
+              execFileSync("ssh", ["-O", "stop", "-S", state.socketPath, state.host], { stdio: "pipe" })
             } catch {}
             sessionMap.delete(ctx.sessionID)
 
@@ -95,8 +110,9 @@ export default {
 
         if (input.tool === "bash") {
           const cmd = output.args.command
-          if (cmd.startsWith(`ssh -S "${state.socketPath}"`)) return
-          output.args.command = `ssh -S "${state.socketPath}" "${state.host}" ${cmd}`
+          const wrappedPrefix = ["ssh", "-S", state.socketPath, state.host].map(shellQuote).join(" ")
+          if (cmd.startsWith(`${wrappedPrefix} `)) return
+          output.args.command = ["ssh", "-S", state.socketPath, state.host, cmd].map(shellQuote).join(" ")
           if (output.args.description) {
             output.args.description = `[remote ${state.host}] ${output.args.description}`
           }
@@ -111,7 +127,7 @@ export default {
         }
 
         if (input.tool === "write") {
-          output.args.filePath = path.join(os.tmpdir(), `__opencode_remote_write__`)
+          output.args.filePath = path.join(tempDir, `remote-write-${randomBytes(16).toString("hex")}`)
           output.args.content = "This tool is not available in remote mode."
           return
         }
