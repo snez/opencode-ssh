@@ -1,10 +1,11 @@
 {
   "name": "opencode-ssh",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Run opencode agents on remote servers via persistent SSH connections",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
+    ".": "./src/index.ts",
     "./server": "./src/index.ts"
   },
   "license": "MIT",
@@ -13,12 +14,14 @@
     "url": "https://github.com/snez/opencode-ssh"
   },
   "engines": {
-    "opencode": ">=1.14.0"
+    "opencode": ">=1.18.29"
   },
   "dependencies": {
-    "zod": "^3.23.0"
+    "@opencode-ai/plugin": "^1.18.29",
+    "@opencode/plugin": "^2.1.4"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
   }
 }

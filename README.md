@@ -7,16 +7,55 @@ Run opencode on a remote server. Say "ssh myHost" and all commands run remotely.
 
 Use to rapidly investigate incidents on remote servers, troubleshoot, analyze logs, data etc.
 
+Targets **OpenCode V2** (`@opencode/plugin` >= 2.1) and **V1** (`@opencode-ai/plugin` >= 1.18.29) from one package.
+
+## How it works
+
+- Opens SSH ControlMaster (`ssh -MNf ...`) for a persistent connection.
+- Hooks `tool.execute.before` to wrap `shell` calls with SSH at runtime.
+- Disables local file tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`) in remote mode.
+- Injects remote-mode instructions into the system prompt (V2: `context` session hook, V1: `experimental.chat.system.transform`).
+
+## Dual V1 + V2 export
+
+```ts
+const v2 = Plugin.define({
+  id: "opencode-ssh",
+  async setup(ctx) {
+    await ctx.tool.transform((editor) => editor.add({ ... }))
+    await ctx.tool.hook("execute.before", (event) => { ... })
+    await ctx.session.hook("context", (event) => { ... })
+    return cleanup
+  },
+})
+
+export default {
+  ...v2,
+  async server() {
+    return { tool: { ... }, "tool.execute.before": ..., "experimental.chat.system.transform": ..., dispose }
+  },
+}
+```
+
+V2 calls `setup()`, V1 calls `server()`. Hook bodies share the same helpers so the two paths cannot drift.
+V1 object entrypoints require OpenCode `1.18.29` or newer.
+
 ## Setup
 
-**1. Copy the plugin**
+**1. Link the plugin** (a real file, not a symlink — OpenCode caches symlinked entrypoints)
 
 ```sh
 mkdir -p ~/.config/opencode/plugins
-cp src/index.ts ~/.config/opencode/plugins/remote.ts
+printf 'export { default } from "../opencode-ssh/src/index.ts"' > ~/.config/opencode/plugins/opencode-ssh.ts
 ```
 
-**2. Create an agent**
+**2. Install deps**
+
+```sh
+cd ~/.config/opencode/opencode-ssh && npm install
+```
+
+**3. Create an agent**
 
 `.opencode/agent/remote.md`:
 ```markdown
@@ -34,15 +73,8 @@ When they say "local", use `ssh_disconnect`.
 
 1. Switch to the **Remote** agent tab.
 2. Say **"ssh myHost"** (replace `myHost` with a host from `~/.ssh/config`).
-3. Ask anything — `bash` commands automatically run on the remote server.
+3. Ask anything — `shell` commands automatically run on the remote server.
 4. Say **"local"** to disconnect.
-
-## How it works
-
-- Opens SSH ControlMaster (`ssh -MNf ...`) for a persistent connection.
-- Hooks into `tool.execute.before` to wrap `bash` calls with SSH at runtime.
-- Disables local file tools (`read`, `write`, `edit`, `glob`, `grep`) in remote mode.
-- Injects remote-mode instructions into the system prompt.
 
 ## Example `~/.ssh/config`
 
