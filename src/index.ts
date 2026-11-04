@@ -13,7 +13,9 @@ type SessionState = {
 const sessionMap = new Map<string, SessionState>()
 
 function sock(host: string) {
-  return path.join(os.homedir(), ".ssh", `cm-${host}`)
+  // Distinct name so it never collides with sockets the user's ~/.ssh/config
+  // creates via ControlPath cm-%r@%h:%p.
+  return path.join(os.homedir(), ".ssh", `cm-opencode-${host.replace(/[^A-Za-z0-9.-]/g, "_")}`)
 }
 
 function ensureSentinel(): string {
@@ -53,7 +55,10 @@ function connect(host: string, sessionID: string): string {
   }
 
   try {
-    execSync(`ssh -MNf -S "${socketPath}" "${host}" 2>&1`, { stdio: "pipe", timeout: 15000 })
+    // Master forks into the background and inherits its parent's pipes, so a
+    // piped stdio never reaches EOF. ignore lets execSync return as soon as
+    // ssh exits (verified: 1.2s vs. ETIMEDOUT at 15s).
+    execSync(`ssh -MNf -S "${socketPath}" "${host}"`, { stdio: "ignore", timeout: 15000 })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     return `Failed to connect to ${host}: ${msg}`
@@ -134,8 +139,14 @@ function neutralizeLocalTool(name: string, args: Record<string, unknown>): boole
 function wrapShell(name: string, args: Record<string, unknown>, state: SessionState): void {
   if (name !== "shell" && name !== "bash") return
   const cmd = typeof args.command === "string" ? args.command : ""
-  if (cmd.startsWith(`ssh -S "${state.socketPath}"`)) return
-  args.command = `ssh -S "${state.socketPath}" "${state.host}" ${cmd}`
+  if (cmd.includes(`-o ControlPath="${state.socketPath}"`)) return
+
+  // Base64 keeps pipes, quotes and newlines intact: the local shell sees only
+  // [A-Za-z0-9+/=] and cannot split the command, so everything runs remotely.
+  const encoded = Buffer.from(cmd, "utf8").toString("base64")
+  const decode = `echo ${encoded} | base64 -d 2>/dev/null || echo ${encoded} | base64 -D`
+
+  args.command = `ssh -o ControlMaster=no -o ControlPath="${state.socketPath}" "${state.host}" 'sh -c "$(${decode})"'`
   if (typeof args.description === "string") {
     args.description = `[remote ${state.host}] ${args.description}`
   }
