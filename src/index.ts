@@ -1,7 +1,7 @@
 import { execSync } from "child_process"
 import path from "path"
 import os from "os"
-import { writeFileSync } from "fs"
+import { existsSync, rmSync, writeFileSync } from "fs"
 import { z } from "zod"
 
 type SessionState = {
@@ -13,6 +13,46 @@ const sessionMap = new Map<string, SessionState>()
 
 function sock(host: string) {
   return path.join(os.homedir(), ".ssh", `cm-${host}`)
+}
+
+/** POSIX single-quote a string so it survives exactly one local shell parse. */
+function shq(s: string): string {
+  return `'${s.replace(/'/g, `'\"'\"'`)}'`
+}
+
+/** Login the SSH config resolves for a host (defaults to the local username). */
+function configuredUser(host: string): string {
+  try {
+    const out = execSync(`ssh -G ${shq(host)}`, {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    }).toString()
+    return /^user (.*)$/m.exec(out)?.[1]?.trim() || os.userInfo().username
+  } catch {
+    return os.userInfo().username
+  }
+}
+
+/** Run a command through an existing ControlMaster; null when unusable. */
+function muxProbe(socketPath: string, host: string, cmd: string): string | null {
+  try {
+    return execSync(`ssh -S ${shq(socketPath)} ${shq(host)} ${shq(cmd)}`, {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10000,
+    }).toString()
+  } catch {
+    return null
+  }
+}
+
+/** True when a live ControlMaster listens on the socket (`ssh -O check`). */
+function masterAlive(socketPath: string, host: string): boolean {
+  try {
+    execSync(`ssh -O check -S ${shq(socketPath)} ${shq(host)}`, { stdio: "pipe", timeout: 10000 })
+    return true
+  } catch {
+    return false
+  }
 }
 
 function ensureSentinel(): string {
@@ -48,23 +88,60 @@ export default {
             const existing = sessionMap.get(ctx.sessionID)
             if (existing) {
               try {
-                execSync(`ssh -O stop -S "${existing.socketPath}" "${existing.host}"`, { stdio: "pipe" })
+                execSync(`ssh -O stop -S ${shq(existing.socketPath)} ${shq(existing.host)}`, { stdio: "pipe" })
+              } catch {}
+              sessionMap.delete(ctx.sessionID)
+            }
+
+            // A live ControlMaster on this socket that we did not create (e.g.
+            // left by another tool, possibly authenticated as a different
+            // user) makes `ssh -MNf` silently disable multiplexing while
+            // still exiting 0 — every wrapped command would then run as
+            // whoever that master authenticated as. Only reuse the socket
+            // when it is alive and speaks as the configured user.
+            if (existsSync(socketPath)) {
+              if (masterAlive(socketPath, host)) {
+                const user = muxProbe(socketPath, host, "whoami")
+                if (user !== null && user.trim() === configuredUser(host)) {
+                  sessionMap.set(ctx.sessionID, { host, socketPath })
+                  return {
+                    title: `Connected to ${host}`,
+                    output: [
+                      `SSH connection to **${host}** established as \`${user.trim()}\` (reusing the existing ControlMaster). All bash commands will now run remotely.`,
+                      `Use bash with \`cat\`, \`tee\`, \`grep\`, \`find\` for file operations.`,
+                      `Say "local" to disconnect.`,
+                    ].join("\n"),
+                  }
+                }
+                // Foreign master: stop it so we can create our own.
+                try {
+                  execSync(`ssh -O stop -S ${shq(socketPath)} ${shq(host)}`, { stdio: "pipe" })
+                } catch {}
+              }
+              // Dead master or unusable socket file: drop it.
+              try {
+                rmSync(socketPath, { force: true })
               } catch {}
             }
 
             try {
-              execSync(`ssh -MNf -S "${socketPath}" "${host}" 2>&1`, { stdio: "pipe", timeout: 15000 })
+              execSync(`ssh -MNf -S ${shq(socketPath)} ${shq(host)}`, { stdio: "pipe", timeout: 15000 })
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e)
               return `Failed to connect to ${host}: ${msg}`
             }
+
+            if (!masterAlive(socketPath, host)) {
+              return `Failed to connect to ${host}: the ControlMaster did not come up.`
+            }
+            const user = muxProbe(socketPath, host, "whoami")
 
             sessionMap.set(ctx.sessionID, { host, socketPath })
 
             return {
               title: `Connected to ${host}`,
               output: [
-                `SSH connection to **${host}** established. All bash commands will now run remotely.`,
+                `SSH connection to **${host}** established as \`${user?.trim() ?? "unknown user"}\`. All bash commands will now run remotely.`,
                 `Use bash with \`cat\`, \`tee\`, \`grep\`, \`find\` for file operations.`,
                 `Say "local" to disconnect.`,
               ].join("\n"),
@@ -80,7 +157,7 @@ export default {
             if (!state) return "Not currently connected."
 
             try {
-              execSync(`ssh -O stop -S "${state.socketPath}" "${state.host}"`, { stdio: "pipe" })
+              execSync(`ssh -O stop -S ${shq(state.socketPath)} ${shq(state.host)}`, { stdio: "pipe" })
             } catch {}
             sessionMap.delete(ctx.sessionID)
 
@@ -96,7 +173,12 @@ export default {
         if (input.tool === "bash") {
           const cmd = output.args.command
           if (cmd.startsWith(`ssh -S "${state.socketPath}"`)) return
-          output.args.command = `ssh -S "${state.socketPath}" "${state.host}" ${cmd}`
+          // Pass the command as a single quoted argument: ssh hands it
+          // verbatim to the remote login shell, so quoting, parentheses and
+          // expansions written for the remote shell keep their meaning (an
+          // unquoted `${cmd}` would be re-parsed by the local shell first
+          // and arrive mangled — and could inject into it).
+          output.args.command = `ssh -S ${shq(state.socketPath)} ${shq(state.host)} ${shq(cmd)}`
           if (output.args.description) {
             output.args.description = `[remote ${state.host}] ${output.args.description}`
           }
